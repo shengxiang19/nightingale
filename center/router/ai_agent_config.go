@@ -8,6 +8,14 @@ import (
 	"github.com/toolkits/pkg/logger"
 )
 
+// AssistantRunOverride 把某一次 assistant 运行固定到指定的 LLM 配置与技能集合，
+// 跳过全局默认/chat agent 的解析。由 AI 定时任务接线：让任务自带的
+// llm_config_id / skill_ids 在每次执行时真正生效（作为 chat agent 解析前的任务级覆盖）。
+type AssistantRunOverride struct {
+	LLMConfigId int64
+	SkillIds    []int64
+}
+
 // buildSkillConfigForAgent translates agent.SkillIds into an aiagent.SkillConfig.
 //
 // Semantics:
@@ -49,11 +57,21 @@ func (rt *Router) buildSkillConfigForAgent(agent *models.AIAgent) *aiagent.Skill
 //
 // 设计取舍：action 的 RequiredSkills 覆盖 agent 绑定。理由是 action 反映"业务路径
 // 需要什么"（代码事实），而 agent 绑定是"运维允许用哪些"（策略偏好）。
-func (rt *Router) resolveSkillConfig(handler *chat.ActionHandler, req *chat.AIChatRequest, agent *models.AIAgent) *aiagent.SkillConfig {
+func (rt *Router) resolveSkillConfig(handler *chat.ActionHandler, req *chat.AIChatRequest, agent *models.AIAgent, override *AssistantRunOverride) *aiagent.SkillConfig {
 	if handler != nil && handler.RequiredSkills != nil {
 		names := handler.RequiredSkills(req)
 		logger.Debugf("[Assistant] action %q declared RequiredSkills=%v, pinned preload", req.ActionKey, names)
 		return &aiagent.SkillConfig{SkillNames: names}
+	}
+	// 任务级技能覆盖 agent 绑定：cron 任务自带 skill_ids 时精确预载，等价于把
+	// agent 的 SkillIds 替换成任务自己的。仅当技能名解析失败或为空时才回落到 agent。
+	if override != nil && len(override.SkillIds) > 0 {
+		names, err := models.AISkillNamesByIds(rt.Ctx, override.SkillIds)
+		if err != nil {
+			logger.Warningf("[Assistant] load task skill names failed, falling back to agent binding: %v", err)
+		} else if len(names) > 0 {
+			return &aiagent.SkillConfig{SkillNames: names}
+		}
 	}
 	return rt.buildSkillConfigForAgent(agent)
 }

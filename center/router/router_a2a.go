@@ -60,7 +60,7 @@ func (b *a2aBackend) EnsureAssistantChat(userID int64, chatID string, page model
 }
 
 func (b *a2aBackend) StartAssistantMessage(userID int64, chat *models.AssistantChat, query models.AssistantMessageQuery, lang string) (*a2a.MessageStartResult, int, error) {
-	res, status, err := b.rt.StartAssistantMessage(userID, chat, query, lang)
+	res, status, err := b.rt.StartAssistantMessage(userID, chat, query, lang, nil)
 	if err != nil {
 		return nil, status, err
 	}

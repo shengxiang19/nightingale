@@ -147,7 +147,7 @@ func (rt *Router) classifyApprovalLLM(confirmPrompt, reply string) string {
 	if err != nil {
 		logger.Warningf("[Assistant] approval classify: load chat agent: %v", err)
 	}
-	llmCfg := rt.resolveChatLLMConfig(agent)
+	llmCfg := rt.resolveChatLLMConfig(agent, nil)
 	if llmCfg == nil {
 		return approvalUnclear
 	}

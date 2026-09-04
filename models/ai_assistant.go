@@ -12,6 +12,11 @@ type AssistantChat struct {
 	// IsRenamed prevents the first message from replacing a title explicitly
 	// chosen by the user before the message is sent.
 	IsRenamed bool `json:"is_renamed"`
+	// TaskId > 0 标记该会话由定时任务（ai_cron_task）的一次执行创建：这类会话
+	// 不出现在普通「历史会话」列表，而是按任务聚合到侧边栏的「任务」区块。
+	// TaskName 冗余存储任务名，任务被删除后文件夹仍能正常显示。
+	TaskId   int64  `json:"task_id,omitempty"`
+	TaskName string `json:"task_name,omitempty"`
 }
 
 type AssistantPageType string
