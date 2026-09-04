@@ -522,3 +522,42 @@ ALTER TABLE `source_token` ADD KEY `idx_source_token_token` (`token`);
    PostgreSQL 请执行：ALTER TABLE users ADD COLUMN disabled int NOT NULL DEFAULT 0;
    通常不需要手工执行，程序启动时的 AutoMigrate 会补上这一列 */
 ALTER TABLE `users` ADD COLUMN `disabled` int NOT NULL DEFAULT 0 COMMENT '0:enabled 1:disabled';
+
+/* v9 2026-09-07 AI cron task: a scheduled task that periodically runs an AI agent prompt */
+CREATE TABLE `ai_cron_task` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `name` varchar(255) NOT NULL DEFAULT '' COMMENT 'task name',
+    `description` text COMMENT 'description',
+    `cron_expr` varchar(64) NOT NULL DEFAULT '' COMMENT 'cron expression, standard 5-field, e.g. 0 */1 * * *',
+    `use_case` varchar(64) NOT NULL DEFAULT 'cron_task' COMMENT 'agent use case (= turn chain key), unattended by default',
+    `llm_config_id` bigint NOT NULL DEFAULT 0 COMMENT 'bound ai_llm_config id, 0 = use default llm config',
+    `skill_ids` text COMMENT 'bound skill ids (JSON)',
+    `content` text COMMENT 'prompt/instruction sent to the agent',
+    `enabled` tinyint(1) NOT NULL DEFAULT 0 COMMENT 'enabled flag',
+    `last_run_at` bigint NOT NULL DEFAULT 0 COMMENT 'last run unix time',
+    `next_run_at` bigint NOT NULL DEFAULT 0 COMMENT 'next scheduled run unix time',
+    `last_status` varchar(32) NOT NULL DEFAULT '' COMMENT 'last run status: success/failed/running/pending',
+    `created_at` bigint NOT NULL DEFAULT 0 COMMENT 'create time',
+    `created_by` varchar(64) NOT NULL DEFAULT '' COMMENT 'creator',
+    `updated_at` bigint NOT NULL DEFAULT 0 COMMENT 'update time',
+    `updated_by` varchar(64) NOT NULL DEFAULT '' COMMENT 'updater',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_creator_name` (`created_by`, `name`) COMMENT 'unique task name per creator'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='ai cron tasks';
+
+/* use_case 现在同时是"资源链键"：cron_task 走无人值守链。该列此前从未在界面上
+   暴露过，因此历史行里的 'chat' 都是旧列默认值而非有意配置，一律归一。 */
+UPDATE `ai_cron_task` SET `use_case` = 'cron_task' WHERE `use_case` = '' OR `use_case` = 'chat';
+
+CREATE TABLE `ai_cron_task_log` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `task_id` bigint NOT NULL DEFAULT 0 COMMENT 'ai_cron_task id',
+    `chat_id` varchar(64) NOT NULL DEFAULT '' COMMENT 'assistant chat id of this execution',
+    `seq_id` bigint NOT NULL DEFAULT 0 COMMENT 'message seq id within chat',
+    `status` varchar(32) NOT NULL DEFAULT 'running' COMMENT 'running/success/failed/pending',
+    `started_at` bigint NOT NULL DEFAULT 0 COMMENT 'start unix time',
+    `ended_at` bigint NOT NULL DEFAULT 0 COMMENT 'end unix time',
+    `error` text COMMENT 'error message when failed',
+    PRIMARY KEY (`id`),
+    KEY `idx_task_id` (`task_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='ai cron task execution logs';

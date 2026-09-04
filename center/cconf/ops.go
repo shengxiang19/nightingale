@@ -304,6 +304,8 @@ ops:
       cname: AI Config - LLM Configs
     - name: /ai-config/skills
       cname: AI Config - Skills
+    - name: /ai-config/cron-tasks
+      cname: AI Config - Cron Tasks
 
 `
 )

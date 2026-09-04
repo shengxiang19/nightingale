@@ -142,12 +142,11 @@ Output ONLY the JSON {"verdict":"approve|reject|unclear"} with no other text.`
 // classifyApprovalLLM 对精确匹配接不住的自由文本做 LLM 意图三分类（Layer 3，
 // 多语言）。配置缺失、调用失败、输出不可解析一律降级 unclear——回归 agent
 // 流程重提案，结构化/精确两层保持零 LLM 依赖。
+// 取 LLM 走 chat 链（chatTurnContextBestEffort + resolveTurnLLM），与主流程同一
+// 份优先级声明，不再有第二个选取入口。
 func (rt *Router) classifyApprovalLLM(confirmPrompt, reply string) string {
-	agent, err := models.AIAgentGetByUseCase(rt.Ctx, "chat")
-	if err != nil {
-		logger.Warningf("[Assistant] approval classify: load chat agent: %v", err)
-	}
-	llmCfg := rt.resolveChatLLMConfig(agent)
+	tc := rt.chatTurnContextBestEffort()
+	llmCfg, _, _ := rt.resolveTurnLLM(tc)
 	if llmCfg == nil {
 		return approvalUnclear
 	}

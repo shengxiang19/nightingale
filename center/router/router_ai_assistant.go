@@ -103,6 +103,63 @@ func (rt *Router) assistantChatHistory(c *gin.Context) {
 	ginx.NewRender(c).Data(chats, nil)
 }
 
+// AssistantChatTaskGroup is one folder of the sidebar 「任务」 section: a cron
+// task and its execution chats (newest first — chats arrive pre-sorted).
+type AssistantChatTaskGroup struct {
+	TaskId   int64                  `json:"task_id"`
+	TaskName string                 `json:"task_name"`
+	Chats    []models.AssistantChat `json:"chats"`
+}
+
+// assistantChatTasks serves the scheduled-task execution chats grouped by task
+// for the Nightingale AI sidebar. Chat-level fields live in the JSON blob, so
+// grouping happens here over the decoded chats. Folder labels use the task's
+// CURRENT name from ai_cron_task (so renames propagate), falling back to the
+// denormalized chat.TaskName for tasks that have been deleted.
+func (rt *Router) assistantChatTasks(c *gin.Context) {
+	me := c.MustGet("user").(*models.User)
+	chats, err := models.AssistantTaskChatGetsByUserID(rt.Ctx, me.Id)
+	ginx.Dangerous(err)
+
+	groups := make([]AssistantChatTaskGroup, 0)
+	index := make(map[int64]int)
+	for _, chat := range chats {
+		if i, ok := index[chat.TaskId]; ok {
+			groups[i].Chats = append(groups[i].Chats, chat)
+			continue
+		}
+		index[chat.TaskId] = len(groups)
+		groups = append(groups, AssistantChatTaskGroup{
+			TaskId:   chat.TaskId,
+			TaskName: chat.TaskName,
+			Chats:    []models.AssistantChat{chat},
+		})
+	}
+
+	// Override with current task names (single batched query).
+	if len(groups) > 0 {
+		ids := make([]int64, 0, len(groups))
+		for _, g := range groups {
+			ids = append(ids, g.TaskId)
+		}
+		if tasks, terr := models.AICronTaskGets(rt.Ctx, "id IN (?)", ids); terr != nil {
+			logger.Warningf("[Assistant] load cron task names for sidebar: %v", terr)
+		} else {
+			names := make(map[int64]string, len(tasks))
+			for _, t := range tasks {
+				names[t.Id] = t.Name
+			}
+			for i := range groups {
+				if name, ok := names[groups[i].TaskId]; ok && name != "" {
+					groups[i].TaskName = name
+				}
+			}
+		}
+	}
+
+	ginx.NewRender(c).Data(groups, nil)
+}
+
 func (rt *Router) assistantChatRename(c *gin.Context) {
 	var req struct {
 		ChatID string `json:"chat_id"`
@@ -161,7 +218,7 @@ func (rt *Router) assistantMessageNew(c *gin.Context) {
 	// output to the UI language (see chat.LanguageDirective).
 	lang := c.GetHeader("X-Language")
 
-	result, status, err := rt.StartAssistantMessage(me.Id, chat, req.Query, lang)
+	result, status, err := rt.StartAssistantMessage(me.Id, chat, req.Query, lang, nil)
 	if err != nil {
 		// Business errors (status != 0, e.g. 409 busy) keep their explicit
 		// status code via Bomb. System errors (status == 0) fall through to
@@ -182,7 +239,7 @@ func (rt *Router) assistantMessageNew(c *gin.Context) {
 	}, nil)
 }
 
-func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCancel context.CancelFunc, lock *models.ChatLock, state *MessageState, streamID string, userId int64, lang string) {
+func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCancel context.CancelFunc, lock *models.ChatLock, state *MessageState, streamID string, userId int64, lang string, opts *AssistantRunOptions) {
 	msg := state.Msg()
 
 	// Timing instrumentation: capture per-phase durations so we can answer
@@ -307,20 +364,22 @@ func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCance
 		}
 	}
 
-	// ② Create LLM client（agent 执行用）
-	// Always use "chat" useCase to find the agent config for the LLM client.
-	agent, err := models.AIAgentGetByUseCase(rt.Ctx, "chat")
-	if err != nil || agent == nil {
-		rt.finishMessage(state, streamID, 400, "no AI agent configured for use_case=chat")
+	// ② Resolve the run config（use_case 选 agent 基线 + 资源链 + 任务级覆盖）——
+	// 构造一次 TurnContext，下游只消费结果（见 router_ai_turn.go）。默认 chat；
+	// cron 任务经 opts.UseCase=cron_task 绑定自己的 agent，并走无人值守链（固定
+	// cron_task handler、汇报式 prompt、不给"下一步建议"）；任务自带的 llm_config_id /
+	// skill_ids 作为 TaskOverrides 进入链的最高优先级节点。
+	// 失败按返回的 HTTP 状态收口：400 无可用 agent、409 无可用 LLM（前端据此弹
+	// 「去配置」引导）、500 系统错误。
+	tc, rStatus, rMsg := rt.newTurnContext(opts)
+	if rStatus != 0 {
+		rt.finishMessage(state, streamID, rStatus, rMsg)
 		return
 	}
 
-	llmCfg := rt.resolveChatLLMConfig(agent)
-	if llmCfg == nil {
-		// 用 409 作为业务错误码（写进 message.ErrCode），前端读 body.dat.err_code
-		// 识别"未配置 LLM"这条特定错误，弹"去配置"引导而非通用 toast。HTTP 状态
-		// 码保持 200——/detail 接口对所有完成态消息都是 200，错误细节走 body。
-		rt.finishMessage(state, streamID, http.StatusConflict, "no LLM configured, please configure one in system settings")
+	llmCfg, rStatus, rMsg := rt.resolveTurnLLM(tc)
+	if rStatus != 0 {
+		rt.finishMessage(state, streamID, rStatus, rMsg)
 		return
 	}
 
@@ -343,13 +402,15 @@ func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCance
 	// 旁路分类器看不到完整语境、串行 1.4-3s、分错即漏门；
 	// 开放输入交给通用 agent + 技能目录自取，确定性门由工具层兜底。
 	// 前端 action.key 通道已废弃——fe 发送前一律剥掉 key，
-	// 专用 action 条目随之删除；未来非对话场景需要时再加回）：
-	//   1. Creation fast-path — 创建动词命中 → creation（保住零 LLM 即时弹表单的 UX）
-	//   2. 表单延续 — 上轮以 form_select 收尾且本轮带 action.param（= 表单提交），
-	//      确定性继承上轮 action，替代原先靠分类器判"延续"
-	//   3. 默认 — general_chat 通用路径
+	// 专用 action 条目随之删除；未来非对话场景需要时再加回）。
+	// 走哪条路由由本轮 use_case 声明的链决定（见 TurnContext.resolveAction）：
+	//   交互轮（chat）——1. Creation fast-path：创建动词命中 → creation（保住零 LLM
+	//     即时弹表单的 UX）；2. 表单延续：上轮以 form_select 收尾且本轮带
+	//     action.param，确定性继承上轮 action；3. 默认 general_chat 通用路径。
+	//   无人值守轮（cron_task）——固定在链上声明的 handler，不做内容路由：任务正文
+	//     里的"创建/新建"动词不该被 fast-path 接走，那会弹一张没人能填的表单。
 	tIntentStart := time.Now()
-	actionKey, method := resolveActionKey(msg.Query.Content, len(msg.Query.Action.Param), prevRoute)
+	actionKey, method := tc.resolveAction(msg.Query.Content, len(msg.Query.Action.Param), prevRoute)
 	intentMethod = method
 	tIntent = time.Since(tStart)
 	intentDur := time.Since(tIntentStart)
@@ -361,9 +422,11 @@ func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCance
 		actionKey = string(models.ActionKeyGeneralChat)
 		handler, _ = chat.Lookup(actionKey)
 	}
+	// 供技能链的 handler 节点（RequiredSkills）读取——见 resolveTurnSkills。
+	tc.Handler = handler
 
-	logger.Infof("[Assistant] chat=%s seq=%d action_key=%s content=%q",
-		msg.ChatID, msg.SeqID, actionKey, msg.Query.Content)
+	logger.Infof("[Assistant] chat=%s seq=%d use_case=%s action_key=%s content=%q",
+		msg.ChatID, msg.SeqID, tc.UseCase, actionKey, msg.Query.Content)
 	logger.Infof("[Assistant.Timing] chat=%s seq=%d phase=intent_resolved method=%s dur=%dms total=%dms action_key=%s",
 		msg.ChatID, msg.SeqID, intentMethod, intentDur.Milliseconds(), tIntent.Milliseconds(), actionKey)
 
@@ -389,10 +452,20 @@ func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCance
 	// 把用户粘贴的 /alert-rules/edit/<id>、/dashboards/<id> URL 提取成
 	// rule_id/dashboard_id 注入 Context，通用路径上的编辑请求免一轮工具解析。
 	chat.EnrichContextFromText(chatReq)
+	tc.Req = chatReq
 
 	// ④ Preflight — hard gate. May halt the turn and emit structured responses
 	// (e.g. ask the user to pick a busi group before a creation skill runs).
 	toolDeps := rt.buildToolDeps()
+	// 无人值守轮唯一保留的能力收紧：脚本执行。run_skill_script 不在 SelectTools 里，
+	// 由 agent 层按 toolDeps.Sandbox 自动注入（见 aiagent/agent.go），只有摘掉
+	// Sandbox 才能真正挡住它；而它没有确认门（skill_exec.go 直接执行），定时任务
+	// 无人值守地跑任意技能脚本属于项目约束里"必须人工确认"的高危写操作。
+	// 写工具不在此列——它们自带缺参门/提案确认门，缺参或待确认时留下表单/提案，
+	// 由人在执行会话里接管。
+	if !tc.Interactive() {
+		toolDeps.Sandbox = nil
+	}
 
 	// Resolve the requesting user once: preflight needs it, and the external
 	// tool-source hook (agentToolSources) scopes its sources per this user.
@@ -484,10 +557,13 @@ func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCance
 	// fmt.Sprintf 把 msg.Query.Content 原样拼进 userPrompt，不能再经 text/template
 	// 解析——否则用户问 "告警模板怎么写 {{ .Alertname }}" 会让 Parse 失败，整轮 500。
 	//
-	// Skills 绑定：agent.SkillIds 非空时走"精确注入"路径（SkillNames），空则不
-	// 预载——系统提示词常驻技能目录，模型经 load_skill 自取。action handler 若
-	// 声明了 RequiredSkills，则覆盖上述两者——见 resolveSkillConfig。
-	skillCfg := rt.resolveSkillConfig(handler, chatReq, agent)
+	// Skills 绑定：沿本轮 use_case 声明的链取值（见 resolveTurnSkills）。
+	// 交互轮 = handler.RequiredSkills > agent.SkillIds > 目录自取——agent 绑定非空时
+	// 走"精确注入"（SkillNames），空则不预载（系统提示词常驻技能目录，模型经
+	// load_skill 自取），handler 声明 RequiredSkills 时覆盖上述两者；
+	// 无人值守轮 = 任务 skill_ids > agent.SkillIds > 目录自取——handler 整节摘除，
+	// 否则 general_chat 的"显式不预载"空切片会静默清空任务配置的技能。
+	skillCfg := rt.resolveTurnSkills(tc)
 	// 私有 skill 仅对授权团队可见：把当前用户在 AI 对话里看不到的私有 skill
 	// 从常驻技能目录里过滤掉（与运行时加载层同一份名单，见上 hiddenSkills）。
 	// denySkills 为 fail-closed 兜底：无法算出名单时目录留空 + 拒绝所有预载/注入。
@@ -499,9 +575,11 @@ func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCance
 		Timeout:            agentTotalTimeout,
 		Stream:             true,
 		UserPromptRendered: userPrompt,
-		GuidedFollowup:     true, // 交互式 chat：末尾给可点选的"下一步"建议
+		// 交互轮末尾给可点选的"下一步"建议；无人值守轮（定时任务）不给——没有
+		// 人可以点，且"下一步"会污染汇报式输出。
+		GuidedFollowup:     tc.Interactive(),
 		Skills:             skillCfg,
-		ToolSources:        rt.agentToolSources(agent, me),
+		ToolSources:        rt.agentToolSources(tc.Agent, me),
 		HistoryBudgetBytes: historyBudgetFromContextLength(llmCfg.ExtraConfig.ContextLength),
 	}, aiagent.WithLLMClient(llmClient), aiagent.WithToolDeps(toolDeps))
 
@@ -653,6 +731,14 @@ func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCance
 				Prompt:             chunk.Content,
 				SeqID:              msg.SeqID,
 				ResumeAfterConfirm: resumeAfter,
+			}
+			if !tc.Interactive() {
+				// 无人值守轮以人在环中断收尾（工具缺参弹表单 / 写操作待确认）：轮次挂起
+				// 等人接管，这是预期路径（定时任务的写工具与交互轮同一套，见 chat/actions.go）。
+				// 记一条日志解释"执行日志显示 success 但消息其实是一张待填表单"——success
+				// 只代表分派成功，任务真正的终态要看消息是否 IsFinish 且无待确认提案。
+				logger.Infof("[Assistant] unattended turn ended awaiting human input tool=%s kind=%s chat=%s seq=%d",
+					toolName, kind, msg.ChatID, msg.SeqID)
 			}
 		case aiagent.StreamTypeError:
 			errMsg := chunk.Error
@@ -860,37 +946,6 @@ func (rt *Router) processAssistantMessage(parentCtx context.Context, parentCance
 		streamDur,
 		(tPersisted - tStreamDone).Milliseconds(),
 	)
-}
-
-// resolveChatLLMConfig 选取 chat 路径的有效 LLM 配置：is_default 优先于 agent
-// 绑定。用户在 LLM 配置列表把某条标为"默认"，直觉预期就是对话立刻切到该模型——
-// 若 agent 绑定优先，默认标记会被静默忽略，用户很难发现 chat 实际在用 Agent
-// 设置页绑定的另一条配置。agent 绑定降级为兜底：没有任何配置标默认时才生效。
-// 返回 nil = 无可用配置。chat 主流程与 approval 意图分类共用同一选取逻辑。
-func (rt *Router) resolveChatLLMConfig(agent *models.AIAgent) *models.AILLMConfig {
-	llmCfg, err := models.AILLMConfigPickDefault(rt.Ctx) // 内部已过滤 enabled
-	if err != nil {
-		logger.Warningf("[Assistant] pick default LLM config failed: %v", err)
-	}
-	if llmCfg != nil {
-		return llmCfg
-	}
-	if agent == nil || agent.LLMConfigId <= 0 {
-		return nil
-	}
-	llmCfg, err = models.AILLMConfigGetById(rt.Ctx, agent.LLMConfigId)
-	if err != nil {
-		logger.Warningf("[Assistant] load agent LLM config id=%d failed: %v", agent.LLMConfigId, err)
-		return nil
-	}
-	// AILLMConfigGetById 是通用 getter，故意不过滤 enabled——管理后台编辑页要能
-	// 查出已禁用的记录。但用在 chat 业务路径，命中已禁用配置时应当视为"agent 没
-	// 可用 LLM"。
-	if llmCfg != nil && !llmCfg.Enabled {
-		logger.Infof("[Assistant] agent's bound LLM config id=%d is disabled", llmCfg.Id)
-		return nil
-	}
-	return llmCfg
 }
 
 // chatLLMClient 由 LLM 配置构造（缓存的）客户端，并返回单次 LLM HTTP 调用的
@@ -1277,7 +1332,15 @@ func (rt *Router) assistantMessageHistory(c *gin.Context) {
 
 	me := c.MustGet("user").(*models.User)
 	_, err := models.AssistantChatCheckOwner(rt.Ctx, req.ChatID, me.Id)
-	ginx.Dangerous(err)
+	if err != nil {
+		// 会话已被删除（客户端仍持有其 id，比如 localStorage 里的「上次会话」或
+		// 定时任务执行历史）：返回空历史让前端静默展示空会话，而不是报错。
+		if errors.Is(err, models.ErrAssistantChatNotFound) {
+			ginx.NewRender(c).Data([]models.AssistantMessage{}, nil)
+			return
+		}
+		ginx.Dangerous(err)
+	}
 
 	msgs, err := models.AssistantMessageGetsByChat(rt.Ctx, req.ChatID)
 	ginx.Dangerous(err)

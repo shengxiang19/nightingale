@@ -12,6 +12,11 @@ type AssistantChat struct {
 	// IsRenamed prevents the first message from replacing a title explicitly
 	// chosen by the user before the message is sent.
 	IsRenamed bool `json:"is_renamed"`
+	// TaskId > 0 标记该会话由定时任务（ai_cron_task）的一次执行创建：这类会话
+	// 不出现在普通「历史会话」列表，而是按任务聚合到侧边栏的「任务」区块。
+	// TaskName 冗余存储任务名，任务被删除后文件夹仍能正常显示。
+	TaskId   int64  `json:"task_id,omitempty"`
+	TaskName string `json:"task_name,omitempty"`
 }
 
 type AssistantPageType string
@@ -151,12 +156,17 @@ type AssistantMessageResponse struct {
 
 type AssistantActionKey string
 
-// 仅存对话路径实际可达的两个 action（路由收缩 + fe 剥 action.key 后，
+// 仅存对话路径实际可达的三个 action（路由收缩 + fe 剥 action.key 后，
 // 历史上的专用 action 常量已随 chat.registry 条目一并删除；
 // 未知 key 由 router 兜底降级到 general_chat）。
 const (
 	ActionKeyGeneralChat AssistantActionKey = "general_chat"
 	ActionKeyCreation    AssistantActionKey = "creation"
+	// ActionKeyCronTask 定时任务的无人值守路径：use_case=cron_task 的轮次由
+	// turnResourceChains 固定路由到这里，不做内容路由（任务正文里的创建动词不该
+	// 触发 creation fast-path）。与 AIAgent 的 UseCaseCronTask 同名同值是有意的
+	// ——"这个 use_case 的轮次走这条 handler"在注册表里声明一次。
+	ActionKeyCronTask AssistantActionKey = "cron_task"
 )
 
 type AssistantAction struct {

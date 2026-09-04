@@ -11,6 +11,17 @@ import (
 	"gorm.io/gorm"
 )
 
+// AIAgent.UseCase 的已注册取值。UseCase 本身是开放 varchar（运维可自定义），但每个
+// 取值都必须在 center/router 的 turnResourceChains 里注册一条资源链（值守模式 +
+// LLM/技能优先级链），否则该 use_case 的轮次会回落 chat 链并记一条 warning。
+const (
+	// UseCaseChat 交互式对话：用户在场，模型可反问，工具层允许人在环确认。
+	UseCaseChat = "chat"
+	// UseCaseCronTask 无人值守的定时任务执行轮：固定 action、汇报式 prompt、禁止反问。
+	// 工具面与 chat 相同（写工具靠自身缺参门/提案确认门兜底，中断由人接管）。
+	UseCaseCronTask = "cron_task"
+)
+
 // 所有列都显式声明类型，与 docker/migratesql/migrate.sql 保持一致，理由同 AILLMConfig。
 type AIAgent struct {
 	Id           int64   `json:"id" gorm:"primaryKey;autoIncrement"`
@@ -118,26 +129,44 @@ func AIAgentStatistics(c *ctx.Context) (*Statistics, error) {
 	return StatisticsGet(c, &AIAgent{})
 }
 
-// InitDefaultAIAgent ensures at least one agent exists so aichat works even
-// when the admin UI no longer exposes agent management. If the ai_agent table
-// is empty, create a default use_case=chat agent with LLMConfigId=0 — the
-// runtime resolves it to the default LLM via AILLMConfigPickDefault when the
-// chat turn actually runs. Idempotent.
+// InitDefaultAIAgent ensures every built-in use_case has an agent, so aichat works
+// even when the admin UI no longer exposes agent management. Idempotent:
+//   - use_case=chat — seeded only when the whole table is empty (historic
+//     behavior; an admin who deletes it while other agents exist is respected).
+//   - use_case=cron_task — seeded whenever no agent claims that use_case at all,
+//     because every ai_cron_task defaults to it and a missing baseline would fail
+//     every scheduled run with 400.
+//
+// LLMConfigId=0 in both cases — the turn chain resolves it to the default LLM via
+// AILLMConfigPickDefault when a run actually happens.
 func InitDefaultAIAgent(c *ctx.Context) {
 	var count int64
 	if err := DB(c).Model(&AIAgent{}).Count(&count).Error; err != nil {
 		logger.Warningf("InitDefaultAIAgent count failed: %v", err)
 		return
 	}
-	if count > 0 {
-		return
+	if count == 0 {
+		seedDefaultAIAgent(c, UseCaseChat, "default-chat-agent",
+			"auto-created default chat agent; uses the default LLM config at runtime")
 	}
 
+	var cronCount int64
+	if err := DB(c).Model(&AIAgent{}).Where("use_case = ?", UseCaseCronTask).Count(&cronCount).Error; err != nil {
+		logger.Warningf("InitDefaultAIAgent count cron agents failed: %v", err)
+		return
+	}
+	if cronCount == 0 {
+		seedDefaultAIAgent(c, UseCaseCronTask, "default-cron-task-agent",
+			"auto-created default agent for unattended scheduled tasks (read-only tools); uses the default LLM config at runtime")
+	}
+}
+
+func seedDefaultAIAgent(c *ctx.Context, useCase, name, description string) {
 	now := time.Now().Unix()
 	agent := &AIAgent{
-		Name:        "default-chat-agent",
-		Description: "auto-created default chat agent; uses the default LLM config at runtime",
-		UseCase:     "chat",
+		Name:        name,
+		Description: description,
+		UseCase:     useCase,
 		LLMConfigId: 0,
 		Enabled:     true,
 		CreatedAt:   now,
@@ -146,6 +175,6 @@ func InitDefaultAIAgent(c *ctx.Context) {
 		UpdatedBy:   "system",
 	}
 	if err := Insert(c, agent); err != nil {
-		logger.Warningf("InitDefaultAIAgent insert failed: %v", err)
+		logger.Warningf("InitDefaultAIAgent insert use_case=%s failed: %v", useCase, err)
 	}
 }

@@ -19,12 +19,16 @@ import (
 //     before a creation flow). Returns halt=true to stop; halt=false to proceed.
 //  2. SelectTools / BuildPrompt — configure the agent for this action.
 //
-// registry 收缩后仅存对话路径实际可达的 general_chat（默认）与 creation
-// （创建动词 fast-path）两个 action。历史上的专用 action（query_generator /
-// edit / troubleshooting / doc_qa 等）连同 Validate / BuildInputs /
-// ParseResponse / AgentMode 等仅它们使用的扩展点已整体删除——能力由
-// general_chat 的工具全集 + 技能目录（load_skill 自取）承接；未来非对话
+// registry 收缩后仅存对话路径实际可达的 general_chat（默认）、creation
+// （创建动词 fast-path）与 cron_task（定时任务的无人值守路径）。历史上的专用
+// action（query_generator / edit / troubleshooting / doc_qa 等）连同 Validate /
+// BuildInputs / ParseResponse / AgentMode 等仅它们使用的扩展点已整体删除——
+// 能力由 general_chat 的工具全集 + 技能目录（load_skill 自取）承接；未来非对话
 // 场景（如嵌入式 NL→PromQL）需要专用配置时再按需加回。
+//
+// 注意 handler 只声明**业务行为**（prompt / 工具裁剪 / preflight）。资源授权面
+// （用哪条 LLM、预载哪些 skill）由 router 的 turnResourceChains 按 use_case 裁决，
+// handler 不参与、也不感知值守模式。
 type ActionHandler struct {
 	Preflight   func(ctx context.Context, deps *aiagent.ToolDeps, req *AIChatRequest, user *models.User) (halt bool, resps []models.AssistantMessageResponse, err error)
 	SelectTools func(req *AIChatRequest) []string
@@ -62,6 +66,15 @@ var registry = map[string]*ActionHandler{
 		BuildPrompt: buildCreationPrompt,
 		// busi_group_id/datasource_id/team_ids 经 router 默认的 ContextForwardInputs
 		// 转发抵达工具层。
+	},
+	// cron_task：AI 定时任务的无人值守执行路径。use_case=cron_task 的轮次由 router
+	// 的 turnResourceChains 固定路由到这里，不走内容路由（任务正文里的创建动词不该
+	// 触发 creation fast-path）。
+	// 工具面与 general_chat 完全相同（含带门写工具）——定时任务同样需要能落库。
+	// 工具缺参/待确认时会留下表单或提案，由人在执行会话里接管（不额外做只读裁剪）。
+	string(models.ActionKeyCronTask): {
+		BuildPrompt: buildCronTaskPrompt,
+		SelectTools: selectGeneralChatTools,
 	},
 }
 
@@ -355,4 +368,29 @@ func selectGeneralChatTools(req *AIChatRequest) []string {
 		// 写工具自带 /ai-config/skills 权限门 + 两阶段确认门，只读的发现工具无副作用。
 		"list_skill_builtin_tools", "get_skill", "create_skill", "update_skill",
 	}
+}
+
+// --- cron_task action（无人值守） ---
+
+// buildCronTaskPrompt 是定时任务执行轮的提示词：汇报式、禁止反问、不编造结果。
+// 与 buildGeneralChatPrompt 的差异是本质的——那条 prompt 服务于"人在场、可追问、
+// 可引导下一步"的交互式问答，这条服务于"跑完即结束"的无人值守汇报，两者不能共用
+// 一份文案（会各自变形）。
+func buildCronTaskPrompt(req *AIChatRequest) string {
+	return fmt.Sprintf(`You are running a SCHEDULED task on the n9e (Nightingale) monitoring platform. This run is unattended — nobody is watching in real time, so any question you ask goes unanswered.
+
+Scheduled task:
+%s
+
+Discipline (STRICT):
+- Execute the task now and report the result. Never ask the user questions, and never end with follow-up questions or "next step" suggestions.
+- Write tools are available. A change may pause for missing parameters or confirmation, leaving a form / proposal for the user to complete later — if that happens, say so plainly and stop. Do not retry, and never invent the missing values.
+- Only claim that something was created, modified or deleted if a tool call in THIS run returned success.
+- Every factual claim must come from tool output. For n9e/categraf specific facts (metric names, config fields, severity mappings, API paths) call search_n9e_docs first — never answer from memory.
+- If a query fails or returns nothing useful, say so plainly instead of guessing. If there is nothing worth reporting, say so in one line.
+
+Report format (Markdown, in the same language as the task above):
+1. Conclusion — one-line summary of the finding.
+2. Details — the supporting data (tables/lists welcome), stating the time range and datasource actually queried.
+3. Suggested actions — only if the data shows something that needs attention.`, req.UserInput)
 }

@@ -83,3 +83,61 @@ func TestGeneralChatFormSubmissionBackfill(t *testing.T) {
 		}
 	}
 }
+
+// TestTurnChainActionRouting：use_case 的差异全部声明在 turnResourceChains 里，
+// 执行器零分支。交互轮走内容路由，无人值守轮固定在链上声明的 handler——
+// 定时任务正文里的创建动词绝不能触发 creation fast-path（那会弹一张没人能填的表单）。
+func TestTurnChainActionRouting(t *testing.T) {
+	// 无人值守轮：固定 action，与正文内容无关。
+	cron := &TurnContext{UseCase: models.UseCaseCronTask, chain: turnResourceChains[models.UseCaseCronTask]}
+	if key, method := cron.resolveAction("创建一条 CPU 告警规则", 0, nil); key != string(models.ActionKeyCronTask) || method != "fixed" {
+		t.Fatalf("cron resolveAction() = (%s, %s), want (cron_task, fixed)", key, method)
+	}
+	if cron.Interactive() {
+		t.Fatal("cron_task 轮必须是无人值守（Interactive=false）")
+	}
+	if _, ok := chat.Lookup(string(models.ActionKeyCronTask)); !ok {
+		t.Fatalf("chat.registry 缺少 %s handler", models.ActionKeyCronTask)
+	}
+
+	// 交互轮：内容路由原样保留（同一句创建动词命中 fast-path）。
+	chatTurn := &TurnContext{UseCase: models.UseCaseChat, chain: turnResourceChains[models.UseCaseChat]}
+	if key, method := chatTurn.resolveAction("创建一条 CPU 告警规则", 0, nil); key != string(models.ActionKeyCreation) || method != "fast" {
+		t.Fatalf("chat resolveAction() = (%s, %s), want (creation, fast)", key, method)
+	}
+	if !chatTurn.Interactive() {
+		t.Fatal("chat 轮必须是交互式（Interactive=true）")
+	}
+}
+
+// TestTurnChainSkillPrecedence：技能链的组成差异——handler 的 RequiredSkills 只
+// 参与交互链。这是任务级技能曾经失效的根因（general_chat 的 pinSkills() 空切片被
+// 当成"显式不预载"压过任务/agent 绑定），两条链的声明必须把这件事固定住。
+// Req 由 router 在技能解析前必然填好（见 processAssistantMessage ③）；两个用例都
+// 不触发 DB 节点（chat 首节点即命中；cron 链不含 handler 节点，Agent 为 nil 时后续
+// 节点自然落空），所以零值 Router 足够。
+func TestTurnChainSkillPrecedence(t *testing.T) {
+	pinned := func(*chat.AIChatRequest) []string { return []string{"pinned-skill"} }
+	rt := &Router{}
+	req := &chat.AIChatRequest{ActionKey: string(models.ActionKeyGeneralChat)}
+
+	chatCfg := rt.resolveTurnSkills(&TurnContext{
+		UseCase: models.UseCaseChat,
+		Handler: &chat.ActionHandler{RequiredSkills: pinned},
+		Req:     req,
+		chain:   turnResourceChains[models.UseCaseChat],
+	})
+	if len(chatCfg.SkillNames) != 1 || chatCfg.SkillNames[0] != "pinned-skill" {
+		t.Fatalf("chat 链应由 handler 声明命中，got %v", chatCfg.SkillNames)
+	}
+
+	cronCfg := rt.resolveTurnSkills(&TurnContext{
+		UseCase: models.UseCaseCronTask,
+		Handler: &chat.ActionHandler{RequiredSkills: pinned},
+		Req:     req,
+		chain:   turnResourceChains[models.UseCaseCronTask],
+	})
+	if len(cronCfg.SkillNames) != 0 {
+		t.Fatalf("cron 链必须摘除 handler 节点（否则任务/agent 绑定会被静默清空），got %v", cronCfg.SkillNames)
+	}
+}

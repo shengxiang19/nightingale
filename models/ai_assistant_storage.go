@@ -200,20 +200,80 @@ func AssistantChatGetsByUserID(c *ctx.Context, userID int64) ([]AssistantChat, e
 		if err != nil || chat == nil {
 			continue
 		}
-		if !chat.IsNew {
-			chats = append(chats, *chat)
+		if chat.IsNew {
+			continue
 		}
+		// 定时任务的执行会话单独聚合在「任务」区块，不混入普通历史会话。
+		if chat.TaskId > 0 {
+			continue
+		}
+		chats = append(chats, *chat)
 	}
 	return chats, nil
 }
 
+// AssistantTaskChatGetsByUserID returns the user's scheduled-task execution
+// chats (TaskId > 0), newest first, for the sidebar "任务" section.
+func AssistantTaskChatGetsByUserID(c *ctx.Context, userID int64) ([]AssistantChat, error) {
+	var rows []AssistantChatRow
+	err := DB(c).Where("user_id = ?", userID).Order("updated_at desc").Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	var chats []AssistantChat
+	for i := range rows {
+		chat, err := decodeChat(&rows[i])
+		if err != nil || chat == nil {
+			continue
+		}
+		if chat.IsNew || chat.TaskId <= 0 {
+			continue
+		}
+		chats = append(chats, *chat)
+	}
+	return chats, nil
+}
+
+// AssistantChatExistIDs returns which of the given chat ids still have a row
+// (existence check only — no blob decoding). Used by the cron-task logs
+// endpoint to flag executions whose result chat was deleted by the user.
+func AssistantChatExistIDs(c *ctx.Context, chatIDs []string) (map[string]bool, error) {
+	exist := make(map[string]bool, len(chatIDs))
+	if len(chatIDs) == 0 {
+		return exist, nil
+	}
+	var rows []AssistantChatRow
+	err := DB(c).Where("chat_id IN (?)", chatIDs).Select("chat_id").Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		exist[row.ChatID] = true
+	}
+	return exist, nil
+}
+
+// ErrAssistantChatNotFound marks a missing chat (e.g. it was deleted while a
+// client still references it). CheckOwner probes existence with a Count first
+// so this normal business miss doesn't surface as a gorm "record not found"
+// ERROR log on every poll/history request from a stale client.
+var ErrAssistantChatNotFound = errors.New("chat not found")
+
 func AssistantChatCheckOwner(c *ctx.Context, chatID string, userID int64) (*AssistantChat, error) {
+	var n int64
+	if err := DB(c).Model(&AssistantChatRow{}).Where("chat_id = ?", chatID).Count(&n).Error; err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, ErrAssistantChatNotFound
+	}
 	chat, err := AssistantChatGet(c, chatID)
 	if err != nil {
 		return nil, err
 	}
 	if chat == nil {
-		return nil, fmt.Errorf("chat not found")
+		return nil, ErrAssistantChatNotFound
 	}
 	if chat.UserID != userID {
 		return nil, fmt.Errorf("forbidden")
@@ -231,15 +291,16 @@ func AssistantChatDelete(c *ctx.Context, chatID string) error {
 // ==================== Message Storage ====================
 
 func AssistantMessageMaxSeqID(c *ctx.Context, chatID string) (int64, error) {
-	var row AssistantMessageRow
-	err := DB(c).Where("chat_id = ?", chatID).Order("seq_id desc").Select("seq_id").First(&row).Error
+	// COALESCE(MAX(...)) in a single aggregate query: a brand-new chat has no
+	// message rows yet, and a First() miss there would be logged as ERROR by
+	// the gorm logger on every first message (cron runs, run-now, new chats).
+	var maxSeq int64
+	err := DB(c).Model(&AssistantMessageRow{}).Where("chat_id = ?", chatID).
+		Select("COALESCE(MAX(seq_id), 0)").Row().Scan(&maxSeq)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return 0, nil
-		}
 		return 0, err
 	}
-	return row.SeqID, nil
+	return maxSeq, nil
 }
 
 func AssistantMessageSet(c *ctx.Context, msg AssistantMessage) error {
