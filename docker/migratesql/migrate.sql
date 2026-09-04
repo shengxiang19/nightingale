@@ -515,3 +515,38 @@ ALTER TABLE `source_token` ADD COLUMN `note` varchar(255) NOT NULL DEFAULT '' CO
    已有的 idx_source_type_id_token 跳过了中间列 source_id 用不上，会退化成扫全部
    source_type='board' 的行。该查询在鉴权之前、每个带 __token 的请求都要打一次 */
 ALTER TABLE `source_token` ADD KEY `idx_source_token_token` (`token`);
+
+/* v9 2026-09-07 AI cron task: a scheduled task that periodically runs an AI agent prompt */
+CREATE TABLE `ai_cron_task` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `name` varchar(255) NOT NULL DEFAULT '' COMMENT 'task name',
+    `description` text COMMENT 'description',
+    `cron_expr` varchar(64) NOT NULL DEFAULT '' COMMENT 'cron expression, standard 5-field, e.g. 0 */1 * * *',
+    `use_case` varchar(64) NOT NULL DEFAULT 'chat' COMMENT 'agent use case, e.g. chat',
+    `llm_config_id` bigint NOT NULL DEFAULT 0 COMMENT 'bound ai_llm_config id, 0 = use default llm config',
+    `skill_ids` text COMMENT 'bound skill ids (JSON)',
+    `content` text COMMENT 'prompt/instruction sent to the agent',
+    `enabled` tinyint(1) NOT NULL DEFAULT 0 COMMENT 'enabled flag',
+    `last_run_at` bigint NOT NULL DEFAULT 0 COMMENT 'last run unix time',
+    `next_run_at` bigint NOT NULL DEFAULT 0 COMMENT 'next scheduled run unix time',
+    `last_status` varchar(32) NOT NULL DEFAULT '' COMMENT 'last run status: success/failed/running',
+    `created_at` bigint NOT NULL DEFAULT 0 COMMENT 'create time',
+    `created_by` varchar(64) NOT NULL DEFAULT '' COMMENT 'creator',
+    `updated_at` bigint NOT NULL DEFAULT 0 COMMENT 'update time',
+    `updated_by` varchar(64) NOT NULL DEFAULT '' COMMENT 'updater',
+    PRIMARY KEY (`id`),
+    KEY `idx_name` (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='ai cron tasks';
+
+CREATE TABLE `ai_cron_task_log` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `task_id` bigint NOT NULL DEFAULT 0 COMMENT 'ai_cron_task id',
+    `chat_id` varchar(64) NOT NULL DEFAULT '' COMMENT 'assistant chat id of this execution',
+    `seq_id` bigint NOT NULL DEFAULT 0 COMMENT 'message seq id within chat',
+    `status` varchar(32) NOT NULL DEFAULT 'running' COMMENT 'running/success/failed',
+    `started_at` bigint NOT NULL DEFAULT 0 COMMENT 'start unix time',
+    `ended_at` bigint NOT NULL DEFAULT 0 COMMENT 'end unix time',
+    `error` text COMMENT 'error message when failed',
+    PRIMARY KEY (`id`),
+    KEY `idx_task_id` (`task_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='ai cron task execution logs';

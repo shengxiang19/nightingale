@@ -102,6 +102,12 @@ type Router struct {
 	aiSkillSyncMu   sync.Mutex
 
 	aiSkillRemoteCommitCache *skill.RemoteCommitCache
+
+	// aiCron is the lazily-initialized scheduler for AI cron tasks (see
+	// ai_cron_task_scheduler.go). Guarded by aiCronMu so enable/disable/run
+	// handlers can touch it even before StartAICronTaskScheduler runs.
+	aiCronMu sync.Mutex
+	aiCron   *AICronScheduler
 }
 
 // TargetDeleteCheckFunc 删除机器前的前置校验，返回不满足删除条件的机器及原因（ident -> 错误信息）。
@@ -710,9 +716,21 @@ func (rt *Router) Config(r *gin.Engine) {
 		pages.GET("/ai-skill-file/:fileId", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillFileGet)
 		pages.DELETE("/ai-skill-file/:fileId", rt.auth(), rt.user(), rt.perm("/ai-config/skills"), rt.aiSkillFileDel)
 
+		// AI Cron Tasks
+		pages.GET("/ai-cron-tasks", rt.auth(), rt.user(), rt.perm("/ai-config/cron-tasks"), rt.aiCronTaskGets)
+		pages.GET("/ai-cron-task/:id", rt.auth(), rt.user(), rt.perm("/ai-config/cron-tasks"), rt.aiCronTaskGet)
+		pages.POST("/ai-cron-tasks", rt.auth(), rt.user(), rt.perm("/ai-config/cron-tasks"), rt.aiCronTaskAdd)
+		pages.PUT("/ai-cron-task/:id", rt.auth(), rt.user(), rt.perm("/ai-config/cron-tasks"), rt.aiCronTaskPut)
+		pages.DELETE("/ai-cron-task/:id", rt.auth(), rt.user(), rt.perm("/ai-config/cron-tasks"), rt.aiCronTaskDel)
+		pages.POST("/ai-cron-task/:id/enable", rt.auth(), rt.user(), rt.perm("/ai-config/cron-tasks"), rt.aiCronTaskEnable)
+		pages.POST("/ai-cron-task/:id/disable", rt.auth(), rt.user(), rt.perm("/ai-config/cron-tasks"), rt.aiCronTaskDisable)
+		pages.POST("/ai-cron-task/:id/run", rt.auth(), rt.user(), rt.perm("/ai-config/cron-tasks"), rt.aiCronTaskRun)
+		pages.GET("/ai-cron-task/:id/logs", rt.auth(), rt.user(), rt.perm("/ai-config/cron-tasks"), rt.aiCronTaskLogs)
+
 		// AI Assistant Chat
 		pages.POST("/assistant/chat/new", rt.auth(), rt.user(), rt.assistantChatNew)
 		pages.GET("/assistant/chat/history", rt.auth(), rt.user(), rt.assistantChatHistory)
+		pages.GET("/assistant/chat/tasks", rt.auth(), rt.user(), rt.assistantChatTasks)
 		pages.POST("/assistant/chat/rename", rt.auth(), rt.user(), rt.assistantChatRename)
 		pages.DELETE("/assistant/chat/:chatId", rt.auth(), rt.user(), rt.assistantChatDel)
 

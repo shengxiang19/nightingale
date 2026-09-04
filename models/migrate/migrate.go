@@ -256,6 +256,7 @@ func MigrateTables(db *gorm.DB) error {
 		&models.EventPipeline{}, &models.EmbeddedProduct{}, &models.SourceToken{},
 		&models.SavedView{}, &models.UserViewFavorite{},
 		&models.AILLMConfig{}, &models.AIAgent{}, &models.AISkill{},
+		&models.AICronTask{}, &models.AICronTaskLog{},
 		&models.AssistantChatRow{}}
 
 	if isPostgres(db) {

@@ -103,6 +103,63 @@ func (rt *Router) assistantChatHistory(c *gin.Context) {
 	ginx.NewRender(c).Data(chats, nil)
 }
 
+// AssistantChatTaskGroup is one folder of the sidebar 「任务」 section: a cron
+// task and its execution chats (newest first — chats arrive pre-sorted).
+type AssistantChatTaskGroup struct {
+	TaskId   int64                  `json:"task_id"`
+	TaskName string                 `json:"task_name"`
+	Chats    []models.AssistantChat `json:"chats"`
+}
+
+// assistantChatTasks serves the scheduled-task execution chats grouped by task
+// for the Nightingale AI sidebar. Chat-level fields live in the JSON blob, so
+// grouping happens here over the decoded chats. Folder labels use the task's
+// CURRENT name from ai_cron_task (so renames propagate), falling back to the
+// denormalized chat.TaskName for tasks that have been deleted.
+func (rt *Router) assistantChatTasks(c *gin.Context) {
+	me := c.MustGet("user").(*models.User)
+	chats, err := models.AssistantTaskChatGetsByUserID(rt.Ctx, me.Id)
+	ginx.Dangerous(err)
+
+	groups := make([]AssistantChatTaskGroup, 0)
+	index := make(map[int64]int)
+	for _, chat := range chats {
+		if i, ok := index[chat.TaskId]; ok {
+			groups[i].Chats = append(groups[i].Chats, chat)
+			continue
+		}
+		index[chat.TaskId] = len(groups)
+		groups = append(groups, AssistantChatTaskGroup{
+			TaskId:   chat.TaskId,
+			TaskName: chat.TaskName,
+			Chats:    []models.AssistantChat{chat},
+		})
+	}
+
+	// Override with current task names (single batched query).
+	if len(groups) > 0 {
+		ids := make([]int64, 0, len(groups))
+		for _, g := range groups {
+			ids = append(ids, g.TaskId)
+		}
+		if tasks, terr := models.AICronTaskGets(rt.Ctx, "id IN (?)", ids); terr != nil {
+			logger.Warningf("[Assistant] load cron task names for sidebar: %v", terr)
+		} else {
+			names := make(map[int64]string, len(tasks))
+			for _, t := range tasks {
+				names[t.Id] = t.Name
+			}
+			for i := range groups {
+				if name, ok := names[groups[i].TaskId]; ok && name != "" {
+					groups[i].TaskName = name
+				}
+			}
+		}
+	}
+
+	ginx.NewRender(c).Data(groups, nil)
+}
+
 func (rt *Router) assistantChatRename(c *gin.Context) {
 	var req struct {
 		ChatID string `json:"chat_id"`
@@ -1277,7 +1334,15 @@ func (rt *Router) assistantMessageHistory(c *gin.Context) {
 
 	me := c.MustGet("user").(*models.User)
 	_, err := models.AssistantChatCheckOwner(rt.Ctx, req.ChatID, me.Id)
-	ginx.Dangerous(err)
+	if err != nil {
+		// 会话已被删除（客户端仍持有其 id，比如 localStorage 里的「上次会话」或
+		// 定时任务执行历史）：返回空历史让前端静默展示空会话，而不是报错。
+		if errors.Is(err, models.ErrAssistantChatNotFound) {
+			ginx.NewRender(c).Data([]models.AssistantMessage{}, nil)
+			return
+		}
+		ginx.Dangerous(err)
+	}
 
 	msgs, err := models.AssistantMessageGetsByChat(rt.Ctx, req.ChatID)
 	ginx.Dangerous(err)
